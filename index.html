@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Remote Alarm Trigger</title>
+    <!-- Load Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom styles for aesthetic alarm look */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0d1117;
+            color: #e6e6e6;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            max-width: 400px;
+            width: 90%;
+            padding: 2rem;
+            background: #161b22;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+        }
+        .alarm-button {
+            transition: all 0.15s ease-in-out;
+            box-shadow: 0 4px 0 0 #b91c1c;
+        }
+        .alarm-button:active {
+            transform: translateY(2px);
+            box-shadow: 0 2px 0 0 #b91c1c;
+        }
+        .alarm-active {
+            animation: pulse-red 0.5s infinite alternate;
+        }
+        @keyframes pulse-red {
+            from { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+            to { box-shadow: 0 0 0 15px rgba(239, 68, 68, 0); }
+        }
+    </style>
+</head>
+<body>
+
+<div id="app-container" class="container rounded-xl flex flex-col items-center space-y-6">
+    <h1 class="text-3xl font-bold text-red-400">Remote Alarm Trigger</h1>
+    <p class="text-sm text-gray-400 text-center">Tap the button below to send an immediate alarm signal to any other device running this same app.</p>
+
+    <!-- Notification Permission Button -->
+    <button id="permission-button"
+            class="w-full py-2 rounded-lg bg-red-800 hover:bg-red-700 text-white text-sm disabled:opacity-50 transition-colors">
+        Enable Notifications (Tap First!)
+    </button>
+    
+    <!-- User ID Display (Crucial for multi-user context) -->
+    <div class="p-2 bg-gray-700 rounded-lg text-sm w-full text-center">
+        <span class="font-semibold text-gray-300">Your Device ID:</span> <span id="user-id-display" class="font-mono text-red-300">Loading...</span>
+    </div>
+
+    <!-- Alarm Trigger Button -->
+    <button id="trigger-button"
+            class="alarm-button w-full py-5 rounded-xl bg-red-600 hover:bg-red-700 text-white font-extrabold text-lg uppercase tracking-wider disabled:opacity-50"
+            disabled>
+        Trigger Remote Alarm
+    </button>
+
+    <!-- Status Message Area -->
+    <div id="status-message" class="text-center p-3 w-full rounded-lg text-red-300 bg-gray-800 transition-all duration-300">
+        Waiting for Firebase initialization...
+    </div>
+
+    <p class="text-xs text-gray-500 pt-4">This system uses Firestore for real-time signaling.</p>
+</div>
+
+<!-- Firebase Imports -->
+<script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, serverTimestamp, deleteDoc, doc, setDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+    import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    // Set Firestore log level for debugging
+    setLogLevel('Debug');
+
+    let db;
+    let auth;
+    let userId = null;
+    let isAuthReady = false;
+    let isAlarmSounding = false;
+    let audioContext = null;
+    let oscillator = null;
+    let notificationPermission = 'default';
+
+    // --- DOM ELEMENTS ---
+    const statusMessageEl = document.getElementById('status-message');
+    const userIdDisplayEl = document.getElementById('user-id-display');
+    const triggerButtonEl = document.getElementById('trigger-button');
+    const appContainerEl = document.getElementById('app-container');
+    const permissionButtonEl = document.getElementById('permission-button');
+
+
+    // --- FIREBASE INITIALIZATION AND AUTHENTICATION ---
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+    const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+    if (firebaseConfig) {
+        const app = initializeApp(firebaseConfig);
+        db = getFirestore(app);
+        auth = getAuth(app);
+
+        // 1. Handle Authentication
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                userId = user.uid;
+                isAuthReady = true;
+                userIdDisplayEl.textContent = userId;
+                statusMessageEl.textContent = 'Ready to send and receive alarms.';
+                triggerButtonEl.disabled = false;
+                
+                // 2. Start the real-time listener ONLY after auth is ready
+                setupAlarmListener();
+            } else {
+                userIdDisplayEl.textContent = 'Signing in...';
+                try {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                } catch (error) {
+                    console.error("Firebase Auth Error:", error);
+                    statusMessageEl.textContent = `Authentication failed: ${error.message}`;
+                }
+            }
+        });
+
+    } else {
+        statusMessageEl.textContent = 'Firebase configuration missing.';
+    }
+
+    // --- NOTIFICATION LOGIC ---
+
+    // Requests permission for native browser notifications.
+    async function requestNotificationPermission() {
+        if (!('Notification' in window)) {
+            alert('This browser does not support desktop notifications.');
+            return;
+        }
+
+        notificationPermission = await Notification.requestPermission();
+        
+        if (notificationPermission === 'granted') {
+            permissionButtonEl.textContent = 'Notifications Enabled';
+            permissionButtonEl.disabled = true;
+            console.log("Notification permission granted.");
+            // Display a welcome notification
+            new Notification('Remote Alarm', {
+                body: 'You will receive an alert when the other device triggers the alarm.',
+                icon: 'https://placehold.co/128x128/ef4444/ffffff?text=AL',
+            });
+        } else if (notificationPermission === 'denied') {
+             permissionButtonEl.textContent = 'Notifications Blocked (Re-enable in browser settings)';
+             permissionButtonEl.disabled = true;
+             permissionButtonEl.classList.remove('bg-red-800');
+             permissionButtonEl.classList.add('bg-gray-500');
+             console.log("Notification permission denied.");
+        }
+    }
+    
+    // Displays the native notification pop-up.
+    function showRemoteNotification(senderId) {
+        if (notificationPermission === 'granted') {
+            new Notification('🚨 ALARM TRIGGERED 🚨', {
+                body: `Signal received from device ID: ${senderId.substring(0, 8)}...`,
+                icon: 'https://placehold.co/128x128/ef4444/ffffff?text=AL',
+                vibrate: [200, 100, 200], // Vibrate pattern on mobile devices
+            });
+        }
+    }
+
+
+    // --- ALARM SOUND LOGIC (Web Audio API for immediate tone) ---
+
+    function startAlarmSound() {
+        if (isAlarmSounding) return;
+        isAlarmSounding = true;
+        appContainerEl.classList.add('alarm-active');
+        statusMessageEl.classList.remove('bg-gray-800', 'text-red-300');
+        statusMessageEl.classList.add('bg-red-600', 'text-white');
+        statusMessageEl.textContent = '!!! INCOMING ALARM SIGNAL !!!';
+
+        // Initialize AudioContext if not already done
+        if (!audioContext) {
+            // Must be created after user interaction on mobile
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+
+        // Create oscillator (sound source)
+        oscillator = audioContext.createOscillator();
+        oscillator.type = 'sine'; // Sine wave is a clean tone
+        oscillator.frequency.setValueAtTime(440, audioContext.currentTime); // 440 Hz (A4)
+        
+        // Create gain node (volume control)
+        const gainNode = audioContext.createGain();
+        gainNode.gain.setValueAtTime(0.5, audioContext.currentTime); // Max volume 50%
+        
+        // Connect oscillator to gain, and gain to speakers
+        oscillator.connect(gainNode);
+        gainNode.connect(audioContext.destination);
+        
+        // Start the sound and stop it after 1.5 seconds
+        oscillator.start();
+        setTimeout(stopAlarmSound, 1500); 
+    }
+
+    function stopAlarmSound() {
+        if (oscillator) {
+            oscillator.stop();
+            oscillator.disconnect();
+            oscillator = null;
+        }
+        isAlarmSounding = false;
+        appContainerEl.classList.remove('alarm-active');
+        statusMessageEl.classList.remove('bg-red-600', 'text-white');
+        statusMessageEl.classList.add('bg-gray-800', 'text-red-300');
+        statusMessageEl.textContent = 'Alarm received and cleared. Ready.';
+    }
+
+    // --- FIRESTORE COMMUNICATION LOGIC ---
+
+    const ALARM_COLLECTION_PATH = `artifacts/${appId}/public/data/alarm_events`;
+
+    /**
+     * Sends the alarm signal by creating a new document in Firestore.
+     */
+    async function sendAlarmSignal() {
+        if (!isAuthReady || !db || !userId) {
+            console.error("App not ready or userId missing.");
+            statusMessageEl.textContent = 'Error: App is not fully initialized.';
+            return;
+        }
+
+        triggerButtonEl.disabled = true;
+        statusMessageEl.textContent = 'Sending alarm signal...';
+
+        try {
+            const alarmCollectionRef = collection(db, ALARM_COLLECTION_PATH);
+
+            await addDoc(alarmCollectionRef, {
+                senderId: userId,
+                timestamp: serverTimestamp(),
+            });
+
+            statusMessageEl.textContent = 'Alarm signal sent successfully!';
+        } catch (error) {
+            console.error("Error sending alarm:", error);
+            statusMessageEl.textContent = `Failed to send alarm: ${error.message}`;
+        } finally {
+            triggerButtonEl.disabled = false;
+        }
+    }
+
+    /**
+     * Sets up the real-time listener for incoming alarm events.
+     */
+    function setupAlarmListener() {
+        if (!isAuthReady || !db || !userId) return;
+
+        const alarmCollectionRef = collection(db, ALARM_COLLECTION_PATH);
+
+        // Query for new alarms, ordered by timestamp (most recent first)
+        const q = query(alarmCollectionRef, orderBy('timestamp', 'desc'));
+
+        // Listen for real-time changes
+        onSnapshot(q, (snapshot) => {
+            snapshot.docChanges().forEach(async (change) => {
+                const alarmData = change.doc.data();
+
+                // Only process documents that are NEWLY added
+                if (change.type === "added") {
+                    
+                    // Prevent the sender from receiving their own alarm signal
+                    if (alarmData.senderId !== userId) {
+                        console.log(`Alarm received from ${alarmData.senderId}`);
+                        
+                        // 1. Play the sound on the receiving device
+                        startAlarmSound();
+                        
+                        // 2. Show the native browser notification
+                        showRemoteNotification(alarmData.senderId);
+
+                        // 3. IMPORTANT: Delete the document to clear the event queue
+                        try {
+                             await deleteDoc(change.doc.ref);
+                             console.log("Alarm document cleared from Firestore.");
+                        } catch (e) {
+                            console.error("Failed to clear alarm document:", e);
+                        }
+                    } else {
+                        // This is the trigger device, log confirmation
+                        console.log("Self-triggered event confirmed.");
+                    }
+                }
+            });
+        }, (error) => {
+            console.error("Firestore Listener Error:", error);
+            statusMessageEl.textContent = 'Real-time listener failed.';
+        });
+    }
+
+    // --- EVENT LISTENERS ---
+    triggerButtonEl.addEventListener('click', sendAlarmSignal);
+    permissionButtonEl.addEventListener('click', requestNotificationPermission);
+
+    // Initial check for notification status
+    document.addEventListener('DOMContentLoaded', () => {
+        if ('Notification' in window) {
+            notificationPermission = Notification.permission;
+            if (notificationPermission === 'granted') {
+                permissionButtonEl.textContent = 'Notifications Enabled';
+                permissionButtonEl.disabled = true;
+            } else if (notificationPermission === 'denied') {
+                permissionButtonEl.textContent = 'Notifications Blocked';
+                permissionButtonEl.disabled = true;
+                permissionButtonEl.classList.remove('bg-red-800');
+                permissionButtonEl.classList.add('bg-gray-500');
+            }
+        } else {
+            permissionButtonEl.textContent = 'Notifications Not Supported';
+            permissionButtonEl.disabled = true;
+        }
+    });
+
+</script>
+
+</body>
+</html>
